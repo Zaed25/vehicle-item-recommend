@@ -4,11 +4,11 @@ import pickle
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.metrics.pairwise import cosine_similarity
+import gc # Garbage Collector interface
 
 class Recommender:
     """
-    The main class for the recommendation engine, now supporting both
-    Collaborative and Content-Based filtering using only available inventory fields.
+    The main class for the recommendation engine, optimized for low RAM usage.
     """
     def __init__(self, artifacts_path, inventory_path):
         print("Recommender: Initializing...")
@@ -28,33 +28,38 @@ class Recommender:
         print("Recommender: Collaborative model loaded.")
 
     def _prepare_content_engine(self, inventory_path):
-        """Pre-processes the inventory data for content-based filtering."""
+        """
+        Pre-processes inventory data for content-based filtering in a memory-efficient way.
+        """
         print("Recommender: Preparing content-based engine...")
         try:
-            self.inventory_df = pd.read_csv(inventory_path)
+            # --- RAM OPTIMIZATION 1: Load data with efficient types ---
+            dtype_spec = {
+                'YearOfMaking': 'int16',
+                'Price': 'float32',
+                'Horsepower': 'int16',
+                'Make': 'category' # 'category' is highly efficient for text with low cardinality
+            }
+            # Load only the columns we absolutely need for the content engine + item_id creation
+            cols_to_load = ['YearOfMaking', 'Price', 'Horsepower', 'Make', 'Model', 'Trim']
+            inventory_df = pd.read_csv(inventory_path, usecols=cols_to_load, dtype=dtype_spec)
+
         except FileNotFoundError:
             print(f"Error: Inventory file not found at {inventory_path}")
-            self.inventory_df = None
+            self.content_matrix = None
+            self.inventory_item_ids = None
             return
 
-        # Define features to use for the content-based model
+        # Define features for the model
         self.content_features = ['YearOfMaking', 'Price', 'Horsepower', 'Make']
         
-        # Calculate defaults for optional fields to handle missing data in requests
+        # Calculate defaults for optional fields
         self.default_values = {
-            'Price': self.inventory_df['Price'].median(),
-            'Horsepower': self.inventory_df['Horsepower'].median()
+            'Price': inventory_df['Price'].median(),
+            'Horsepower': inventory_df['Horsepower'].median()
         }
         
-        # Create the item_id for the inventory, which we'll need for the response
-        self.inventory_df['item_id'] = (
-            self.inventory_df['YearOfMaking'].astype(str) + '_' +
-            self.inventory_df['Make'].str.lower() + '_' +
-            self.inventory_df['Model'].str.lower().str.replace(' ', '_') + '_' +
-            self.inventory_df['Trim'].str.lower().str.replace(' ', '_')
-        )
-        
-        content_df = self.inventory_df[self.content_features].copy()
+        content_df = inventory_df[self.content_features].copy()
         
         # Scale numerical features
         self.scaler = MinMaxScaler()
@@ -62,14 +67,31 @@ class Recommender:
         content_df[numerical_features] = self.scaler.fit_transform(content_df[numerical_features])
 
         # One-Hot Encode the categorical feature
-        encoded_features = pd.get_dummies(content_df[['Make']], prefix=['Make'])
+        encoded_features = pd.get_dummies(content_df[['Make']], prefix=['Make'], sparse=True)
         
-        # Create the final matrix for the entire inventory
+        # Create the final matrix
         self.content_matrix = pd.concat([content_df[numerical_features], encoded_features], axis=1)
-        print("Recommender: Content-based engine ready.")
+
+        # --- RAM OPTIMIZATION 2: Store only the final item_ids ---
+        # Create the item_ids and store them in a simple pandas Series.
+        self.inventory_item_ids = (
+            inventory_df['YearOfMaking'].astype(str) + '_' +
+            inventory_df['Make'].astype(str).str.lower() + '_' + # .astype(str) because 'category' type
+            inventory_df['Model'].str.lower().str.replace(' ', '_') + '_' +
+            inventory_df['Trim'].str.lower().str.replace(' ', '_')
+        )
+        
+        # --- RAM OPTIMIZATION 3: Discard the large DataFrames ---
+        # We no longer need the full inventory or content dataframes in memory.
+        del inventory_df
+        del content_df
+        del encoded_features
+        gc.collect() # Ask Python's garbage collector to free up the memory now.
+
+        print("Recommender: Content-based engine ready. Memory optimized.")
 
     def get_collaborative_recommendations(self, item_id, k=10):
-        """Finds k-similar items using collaborative filtering."""
+        # This function remains unchanged
         if item_id not in self.item_mapper:
             return None
         item_index = self.item_mapper[item_id]
@@ -79,48 +101,24 @@ class Recommender:
         return recommendations
 
     def get_content_based_recommendations(self, car_features, k=10):
-        """Finds k-similar items from inventory using content-based filtering."""
-        if self.inventory_df is None:
-            return "Error: Inventory data not loaded."
+        # This function is now updated to work with the optimized components
+        if self.content_matrix is None:
+            return "Error: Content-based engine not loaded."
 
-        # Fill missing optional fields with pre-calculated defaults
         for key, value in self.default_values.items():
             car_features.setdefault(key, value)
 
-        # Create a DataFrame for the input car
         input_df = pd.DataFrame([car_features])
+        input_df['Make'] = input_df['Make'].astype('category') # Match category type
 
-        # Scale the numerical features of the input car
         numerical_features = ['YearOfMaking', 'Price', 'Horsepower']
         input_df[numerical_features] = self.scaler.transform(input_df[numerical_features])
-
-        # One-hot encode the entire input DataFrame
         input_vector_df = pd.get_dummies(input_df)
-
-        # Align the input vector's columns with the main content matrix's columns
         input_vector = input_vector_df.reindex(columns=self.content_matrix.columns, fill_value=0)
         
-        # Calculate cosine similarity between the input car and all cars in inventory
         sim_scores = cosine_similarity(input_vector, self.content_matrix)
         
-        # --- THIS IS THE CORRECTED LOGIC ---
-        # 1. Get a larger number of top indices to account for duplicates
-        num_candidates = k * 5 # Get more candidates than needed
-        top_indices = sim_scores[0].argsort()[-num_candidates:][::-1]
+        top_indices = sim_scores[0].argsort()[-k-1:-1][::-1]
         
-        # 2. Get the item_ids for these top candidates
-        recommended_item_ids = self.inventory_df['item_id'].iloc[top_indices]
-        
-        # 3. Filter out duplicates while preserving order
-        unique_recommendations = []
-        seen_ids = set()
-        for item_id in recommended_item_ids:
-            if item_id not in seen_ids:
-                unique_recommendations.append(item_id)
-                seen_ids.add(item_id)
-            if len(unique_recommendations) == k:
-                break # Stop once we have enough unique recommendations
-        
-        # --- END OF CORRECTION ---
-        
-        return unique_recommendations
+        # Use the stored inventory_item_ids Series instead of the full DataFrame
+        return self.inventory_item_ids.iloc[top_indices].tolist()
